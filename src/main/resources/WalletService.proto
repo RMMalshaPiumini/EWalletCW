@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+package ds.coursework.grpc.generated;
+
+service WalletService {
+  // 1. Create Account (Req 2.2.2)
+  rpc CreateAccount (CreateAccountRequest) returns (CreateAccountResponse);
+
+  // 2. Get Balance (Req 2.2.3)
+  rpc GetBalance (BalanceRequest) returns (BalanceResponse);
+
+  // 3. Transfer Money (Req 2.2.4) - Supports Intra & Inter-shard
+  rpc TransferFund (TransferRequest) returns (TransferResponse);
+}
+
+message CreateAccountRequest {
+  string userId = 1;
+  double initialBalance = 2;
+}
+
+message CreateAccountResponse {
+  string accountId = 1; // Unique ID across partitions
+  string assignedShardId = 2;
+  bool success = 3;
+  string errorMessage = 4;
+}
+
+message BalanceRequest {
+  string accountId = 1;
+}
+
+message BalanceResponse {
+  double balance = 1;
+  string version = 2; // For "Read Your Writes" consistency
+}
+
+message TransferRequest {
+  string fromAccountId = 1;
+  string toAccountId = 2;
+  double amount = 3;
+}
+
+message TransferResponse {
+  bool success = 1;
+  string transactionId = 2;
+  string errorMessage = 3;
+}
