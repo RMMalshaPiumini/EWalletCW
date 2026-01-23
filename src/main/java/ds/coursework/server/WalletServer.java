@@ -8,8 +8,6 @@ import io.grpc.ServerBuilder;
 public class WalletServer {
     public static void main(String[] args) {
         try {
-            // Usage: java WalletServer <port> <shard_id>
-            // Example: java WalletServer 50051 shard-1
             int port = 50051;
             String shardId = "shard-1";
 
@@ -20,27 +18,23 @@ public class WalletServer {
 
             System.out.println("Starting Wallet Server for " + shardId + " on port " + port);
 
-            // 1. Connect to ZooKeeper (Leader Election)
-            // We use a lock name unique to this shard, e.g., "/lock-shard-1"
             String zkHost = "127.0.0.1:2181";
-            DistributedLock leaderLock = new DistributedLock("lock-" + shardId, zkHost);
+            String etcdHost = "http://127.0.0.1:2379";
 
-            // 2. Start gRPC Server
-            WalletServiceImpl service = new WalletServiceImpl(leaderLock, shardId);
+            DistributedLock leaderLock = new DistributedLock("lock-" + shardId, zkHost);
+            NameServiceClient nameService = new NameServiceClient(etcdHost);
+
+            // Pass 'nameService' to the implementation so it can find other shards
+            WalletServiceImpl service = new WalletServiceImpl(leaderLock, shardId, nameService);
+
             Server server = ServerBuilder.forPort(port)
                     .addService(service)
                     .build()
                     .start();
 
-            // 3. Register with etcd (Service Discovery)
-            // We register as "shard-1" so clients can ask "Where is shard-1?"
-            String etcdHost = "http://127.0.0.1:2379";
-            NameServiceClient nameService = new NameServiceClient(etcdHost);
             nameService.registerService(shardId, "127.0.0.1", port);
             System.out.println("Registered " + shardId + " with NameService at " + etcdHost);
 
-            // 4. Try to become Leader
-            // This runs in a separate thread so it doesn't block the server startup
             new Thread(() -> {
                 try {
                     System.out.println("Attempting to acquire Leadership...");

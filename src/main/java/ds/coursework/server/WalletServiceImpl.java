@@ -1,7 +1,10 @@
 package ds.coursework.server;
 
 import ds.coursework.grpc.generated.*;
+import ds.coursework.naming.NameServiceClient;
 import ds.coursework.sync.DistributedLock;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
 
 import java.util.Map;
@@ -9,29 +12,27 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class WalletServiceImpl extends WalletServiceGrpc.WalletServiceImplBase {
-    // In-memory database to store AccountID -> Balance
     private final Map<String, Double> accountBalances = new ConcurrentHashMap<>();
     private final DistributedLock leaderLock;
     private final String shardId;
+    private final NameServiceClient nameService; // Needed to find other shards
 
-    public WalletServiceImpl(DistributedLock leaderLock, String shardId) {
+    public WalletServiceImpl(DistributedLock leaderLock, String shardId, NameServiceClient nameService) {
         this.leaderLock = leaderLock;
         this.shardId = shardId;
+        this.nameService = nameService;
     }
 
     @Override
     public void createAccount(CreateAccountRequest request, StreamObserver<CreateAccountResponse> responseObserver) {
-        // 1. Check if we are the Leader (Only Leader can create accounts)
         try {
             if (!leaderLock.tryAcquireLock()) {
-                sendError(responseObserver, "I am not the Leader. Writes must go to the Primary.");
+                sendError(responseObserver, "I am not the Leader.");
                 return;
             }
-
-            // 2. Create a unique ID (e.g., "Shard1-User123")
+            // Enforce that this server ONLY creates accounts for its own shard
             String accountId = shardId + "-" + request.getUserId();
 
-            // 3. Store it (Atomically)
             if (accountBalances.containsKey(accountId)) {
                 sendError(responseObserver, "Account already exists.");
                 return;
@@ -39,7 +40,6 @@ public class WalletServiceImpl extends WalletServiceGrpc.WalletServiceImplBase {
             accountBalances.put(accountId, request.getInitialBalance());
             System.out.println("Created Account: " + accountId + " with balance " + request.getInitialBalance());
 
-            // 4. Respond
             CreateAccountResponse response = CreateAccountResponse.newBuilder()
                     .setAccountId(accountId)
                     .setAssignedShardId(shardId)
@@ -47,7 +47,6 @@ public class WalletServiceImpl extends WalletServiceGrpc.WalletServiceImplBase {
                     .build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();
-
         } catch (Exception e) {
             sendError(responseObserver, e.getMessage());
         }
@@ -55,16 +54,43 @@ public class WalletServiceImpl extends WalletServiceGrpc.WalletServiceImplBase {
 
     @Override
     public void getBalance(BalanceRequest request, StreamObserver<BalanceResponse> responseObserver) {
-        // Reads can happen on any node (Leader or Follower) - "Read your writes" handled by client sticking to shard
         Double balance = accountBalances.get(request.getAccountId());
-
         if (balance == null) {
-            // Standard gRPC error could be used here, but returning 0 for simplicity
+            // If not found locally, return 0 (or error)
             responseObserver.onNext(BalanceResponse.newBuilder().setBalance(0.0).build());
         } else {
             responseObserver.onNext(BalanceResponse.newBuilder().setBalance(balance).build());
         }
         responseObserver.onCompleted();
+    }
+
+    @Override
+    public void deposit(DepositRequest request, StreamObserver<DepositResponse> responseObserver) {
+        // This method is called by OTHER servers to move money in
+        try {
+            if (!leaderLock.tryAcquireLock()) {
+                sendError(responseObserver, "I am not the Leader.");
+                return;
+            }
+
+            String accountId = request.getAccountId();
+            double amount = request.getAmount();
+
+            synchronized (accountBalances) {
+                Double currentBalance = accountBalances.get(accountId);
+                if (currentBalance == null) {
+                    // Account doesn't exist here!
+                    responseObserver.onNext(DepositResponse.newBuilder().setSuccess(false).setErrorMessage("Account not found on " + shardId).build());
+                } else {
+                    accountBalances.put(accountId, currentBalance + amount);
+                    System.out.println("External Deposit: Added " + amount + " to " + accountId);
+                    responseObserver.onNext(DepositResponse.newBuilder().setSuccess(true).build());
+                }
+            }
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            sendError(responseObserver, e.getMessage());
+        }
     }
 
     @Override
@@ -79,26 +105,63 @@ public class WalletServiceImpl extends WalletServiceGrpc.WalletServiceImplBase {
             String toId = request.getToAccountId();
             double amount = request.getAmount();
 
-            // CRITICAL SECTION: Atomicity
-            // We lock the whole map logic for this transaction to ensure safety
-            synchronized (accountBalances) {
-                Double fromBalance = accountBalances.get(fromId);
-                Double toBalance = accountBalances.get(toId);
+            // Check if the destination is on THIS shard
+            boolean isLocalTransfer = toId.startsWith(shardId + "-");
 
-                if (fromBalance == null || toBalance == null) {
-                    sendError(responseObserver, "One or both accounts do not exist.");
-                    return;
+            if (isLocalTransfer) {
+                // --- SAME SHARD TRANSFER (Easy) ---
+                synchronized (accountBalances) {
+                    Double fromBal = accountBalances.get(fromId);
+                    Double toBal = accountBalances.get(toId);
+
+                    if (fromBal == null || toBal == null) {
+                        sendError(responseObserver, "One or both accounts do not exist.");
+                        return;
+                    }
+                    if (fromBal < amount) {
+                        sendError(responseObserver, "Insufficient funds.");
+                        return;
+                    }
+                    accountBalances.put(fromId, fromBal - amount);
+                    accountBalances.put(toId, toBal + amount);
+                }
+            } else {
+                // --- CROSS-PARTITION TRANSFER (Complex) ---
+                System.out.println("Initiating Cross-Partition Transfer to " + toId);
+
+                // 1. Deduct locally (Pessimistic Lock)
+                synchronized (accountBalances) {
+                    Double fromBal = accountBalances.get(fromId);
+                    if (fromBal == null || fromBal < amount) {
+                        sendError(responseObserver, "Insufficient funds or account not found.");
+                        return;
+                    }
+                    accountBalances.put(fromId, fromBal - amount);
                 }
 
-                if (fromBalance < amount) {
-                    sendError(responseObserver, "Insufficient funds.");
-                    return;
+                // 2. Call Remote Shard to Deposit
+                boolean remoteSuccess = false;
+                String remoteError = "";
+                try {
+                    String targetShard = toId.split("-")[0] + "-" + toId.split("-")[1]; // extract "shard-2"
+                    remoteSuccess = callRemoteDeposit(targetShard, toId, amount);
+                } catch (Exception e) {
+                    remoteError = e.getMessage();
                 }
 
-                // Perform the swap
-                accountBalances.put(fromId, fromBalance - amount);
-                accountBalances.put(toId, toBalance + amount);
-                System.out.println("Transferred " + amount + " from " + fromId + " to " + toId);
+                // 3. Handle Result
+                if (remoteSuccess) {
+                    System.out.println("Cross-Partition Transfer Successful.");
+                } else {
+                    // COMPENSATING TRANSACTION (Rollback)
+                    System.out.println("Remote deposit failed (" + remoteError + "). Refunding " + fromId);
+                    synchronized (accountBalances) {
+                        Double current = accountBalances.get(fromId);
+                        accountBalances.put(fromId, current + amount);
+                    }
+                    sendError(responseObserver, "Remote transfer failed: " + remoteError);
+                    return;
+                }
             }
 
             TransferResponse response = TransferResponse.newBuilder()
@@ -110,6 +173,30 @@ public class WalletServiceImpl extends WalletServiceGrpc.WalletServiceImplBase {
 
         } catch (Exception e) {
             sendError(responseObserver, e.getMessage());
+        }
+    }
+
+    // Helper to call another server
+    private boolean callRemoteDeposit(String targetShardId, String accountId, double amount) {
+        try {
+            NameServiceClient.ServiceDetails details = nameService.findService(targetShardId);
+            if (details == null) return false;
+
+            ManagedChannel channel = ManagedChannelBuilder.forAddress(details.ip, details.port)
+                    .usePlaintext()
+                    .build();
+            WalletServiceGrpc.WalletServiceBlockingStub stub = WalletServiceGrpc.newBlockingStub(channel);
+
+            DepositResponse response = stub.deposit(DepositRequest.newBuilder()
+                    .setAccountId(accountId)
+                    .setAmount(amount)
+                    .build());
+
+            channel.shutdown();
+            return response.getSuccess();
+        } catch (Exception e) {
+            System.out.println("Remote call failed: " + e.getMessage());
+            return false;
         }
     }
 
