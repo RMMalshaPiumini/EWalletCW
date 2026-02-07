@@ -109,7 +109,7 @@ public class WalletServiceImpl extends WalletServiceGrpc.WalletServiceImplBase {
             boolean isLocalTransfer = toId.startsWith(shardId + "-");
 
             if (isLocalTransfer) {
-                // --- SAME SHARD TRANSFER (Easy) ---
+                // --- SAME SHARD TRANSFER  ---
                 synchronized (accountBalances) {
                     Double fromBal = accountBalances.get(fromId);
                     Double toBal = accountBalances.get(toId);

@@ -38,7 +38,9 @@ public class WalletServer {
             new Thread(() -> {
                 try {
                     System.out.println("Attempting to acquire Leadership...");
-                    leaderLock.acquireLock();
+                    while (!leaderLock.acquireLock()) {
+                        Thread.sleep(2000); // Check every 2 seconds
+                    }
                     System.out.println("I AM THE LEADER now. Accepting writes.");
                 } catch (Exception e) {
                     e.printStackTrace();
